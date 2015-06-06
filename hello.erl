@@ -1,11 +1,12 @@
 -module(hello).
--author('olivier@biniou.info').
 
 -include_lib("wx/include/wx.hrl").
 -include_lib("wx/include/gl.hrl").
 
--export([start/0, loop0/2]).
--export([on/0, off/0]).
+-export([start/0]).
+
+-define(WIDTH,  640).
+-define(HEIGHT, 480).
 
 -define(ZERO, 0.0).
 -define(ONE,  1.0).
@@ -16,23 +17,31 @@
 		{1490,1515}, %% Hebrew
 		{26084,26090},{26400,26415}, {35480,35500}]). %% Japanese
 
-
 start() ->
-    {Env, GL} = gui:env(),
-    Pid = spawn_link(?MODULE, loop0, [Env, GL]),
-    register(?MODULE, Pid),
-    gui:connect(Pid).
+    spawn_link(fun() -> init() end).
 
+init() ->
+    Wx = wx:new(),
+    Frame = wxFrame:new(Wx, ?wxID_ANY, "wxGLFontServer demo",
+			[{pos, {0, 0}}, {size, {?WIDTH, ?HEIGHT}},
+			 {style, ?wxDEFAULT_FRAME_STYLE}]),
+    
+    Opts = [{size, {?WIDTH, ?HEIGHT}}],
+    GLAttrib = [{attribList, [?WX_GL_RGBA, ?WX_GL_DOUBLEBUFFER,
+			      ?WX_GL_DEPTH_SIZE, 24, 0]}],
+    GL = wxGLCanvas:new(Frame, Opts ++ GLAttrib),
 
-on() ->
-    ?MODULE ! enabled.
-off() ->
-    ?MODULE ! disabled.
+    wxFrame:connect(Frame, enter_window),
+    wxFrame:connect(Frame, close_window),
+    wxFrame:connect(Frame, show),
+    %% wxFrame:connect(Frame, key_up),
+    wxFrame:connect(GL,    left_down),
+    wxFrame:connect(GL,    mousewheel),
+    wxFrame:connect(GL,    motion),
+    
+    wxFrame:show(Frame),
+    receive #wx{event=#wxShow{}} -> ok end,
 
-
-%% TODO delete list upon exit
-loop0(Env, GL) ->
-    wx:set_env(Env),
     wxGLCanvas:setCurrent(GL),
     Ver = gl:getString(?GL_VERSION),
     Ven = gl:getString(?GL_VENDOR), 
@@ -48,51 +57,44 @@ loop0(Env, GL) ->
     List = wx_glfont:render_to_list(GLFont, "Hello world!"),
     {ok, File0} = file:read_file(?MODULE_STRING ++ ".erl"),
     %% File = re:split(File0, "\r?\n", [{return, list}]),
+    gl:shadeModel(?GL_SMOOTH),
+    gl:enable(?GL_BLEND),
+
+    gl:depthFunc(?GL_LEQUAL),
+    gl:enable(?GL_DEPTH_TEST),
+    gl:clearColor(1.0,1.0,1.0,1.0),
+
+    gl:matrixMode(?GL_PROJECTION),
+    gl:loadIdentity(),
+
+    glu:perspective(50, ?WIDTH/?HEIGHT, 0.1, 1000),
+    glu:lookAt(0, 0, 3.14,
+	       0, 0, -3.14,
+	       0, 1, 0),
+    set_model_view(),
+
     State = #state{gl=GL, list=List, file=binary_to_list(File0),
 		   font20=GLFont, font10=GLFixed},
     wxFrame:connect(GL, right_up),
     loop(State).
-
+    
 loop(State) ->
     receive
-	enabled ->
-	    loop(State#state{enabled=true});
-
-	disabled ->
-	    loop(State#state{enabled=false});
-
+	#wx{event=#wxClose{}} ->
+	    wx:destroy();
 	#wx{event=#wxMouse{type=right_up}} ->
-	    Dlg = wxFontDialog:new(State#state.gl, wxFontData:new()),
-	    New = case wxFontDialog:showModal(Dlg) of
-		      ?wxID_OK ->
-			  Font = wxFontData:getChosenFont(wxFontDialog:getFontData(Dlg)),
-			  FontDesc = wxFont:getNativeFontInfoUserDesc(Font),
-			  io:format("Selected ~s~n",[FontDesc]),
-			  {ok, GLFixed} = wx_glfont:load_font(Font, [{range, ?CHARS}]),
-			  State#state{font10=GLFixed};
-		      _ ->
-			  State
-		  end,
-	    wxFontDialog:destroy(Dlg),
-	    loop(New);
-	
-	{Pid, {Ref, draw}} ->
-	    draw(State),
-	    Pid ! {Ref, ok},
+	    New = get_font(State),
+	    loop(New)
+    after 0 ->
+	    wx:batch(fun() -> hello(State) end),
+	    wxGLCanvas:swapBuffers(State#state.gl),
 	    NRot = (State#state.rot + 2) rem 360,
 	    loop(State#state{rot=NRot})
     end.
 
-
-draw(State) ->
-    case State#state.enabled of
-	false ->
-	    ok;
-	true ->
-	    wx:batch(fun() -> hello(State) end)
-    end.
-
 hello(State) ->
+    gl:clear(?GL_COLOR_BUFFER_BIT bor ?GL_DEPTH_BUFFER_BIT),
+
     gl:enable(?GL_LIGHT0),
     gl:enable(?GL_LIGHTING),
     gl:enable(?GL_COLOR_MATERIAL),
@@ -113,9 +115,8 @@ hello(State) ->
     gl:disable(?GL_TEXTURE_2D),
     gl:disable(?GL_BLEND).
 
-
 test1(State = #state{font20=Font}) ->
-    u:set_model_view(),
+    set_model_view(),
     gl:rotatef(State#state.rot, 1, 0, 0),
     gl:translatef(-1.0, -0.5, 0),
 
@@ -126,7 +127,7 @@ test1(State = #state{font20=Font}) ->
     wx_glfont:render(Font, String).
 
 test2(State) ->
-    u:set_model_view(),
+    set_model_view(),
     gl:rotatef(-45, 0, 1, 0),
     gl:translatef(-1.0, -0.5, 0),
 
@@ -136,6 +137,9 @@ test2(State) ->
     gl:color3ub(0, 0, 255),
     gl:callList(List).    
 
+set_model_view() ->
+    gl:matrixMode(?GL_MODELVIEW),
+    gl:loadIdentity().
 
 scale({Width, Height}) ->
     gl:scalef(2.0/Width, 1.0/Height, 1.0).
@@ -144,6 +148,7 @@ test3(#state{gl=GL, file=File, font10=Font}) ->
     %%gl:color3ub(255, 255, 255),
     gl:color3ub(0, 0, 0),
     {W,H} = wxWindow:getSize(GL),
+    gl:viewport(0,0,W,H),
     gl:matrixMode(?GL_PROJECTION),
     gl:pushMatrix(),
     gl:loadIdentity(),
@@ -170,3 +175,18 @@ test3(#state{gl=GL, file=File, font10=Font}) ->
     gl:popMatrix(),
     gl:matrixMode(?GL_MODELVIEW).
 
+
+get_font(State) ->
+    Dlg = wxFontDialog:new(State#state.gl, wxFontData:new()),
+    New = case wxFontDialog:showModal(Dlg) of
+	      ?wxID_OK ->
+		  Font = wxFontData:getChosenFont(wxFontDialog:getFontData(Dlg)),
+		  FontDesc = wxFont:getNativeFontInfoUserDesc(Font),
+		  io:format("Selected ~s~n",[FontDesc]),
+		  {ok, GLFixed} = wx_glfont:load_font(Font, [{range, ?CHARS}]),
+		  State#state{font10=GLFixed};
+	      _ ->
+		  State
+	  end,
+    wxFontDialog:destroy(Dlg),
+    New.
