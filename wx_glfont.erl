@@ -39,6 +39,11 @@
 -define(SPACE_Y, 2).  % Space between rows
 -define(BIN_XTRA, 0). %% Safe off-heap alloc
 
+-define(WHITE, {255, 255, 255, 255}).
+-define(BLACK, {0, 0, 0, 255}).
+-define(TRANSP, {0, 0, 0, 0}).
+
+-define(wxGC, wxGraphicsContext).
 
 %%====================================================================
 %% API
@@ -73,9 +78,9 @@ load_font(WxFont, Options) ->
 %% @spec(font_info()) -> {integer(), integer()}.
 %% @desc Returns the size of a string (in scale 1.0).
 text_size(#font{wx=Font}, String) ->
-    MDC  = memory_dc(Font),
-    Size = wxDC:getTextExtent(MDC, String),
-    wxMemoryDC:destroy(MDC),
+    DC  = memory_dc(Font),
+    Size = getTextExtent(DC, String),
+    destroy_dc(DC),
     Size.
 
 %% @spec(font_info()) -> {integer(), integer()}.
@@ -151,58 +156,53 @@ all_chars(Ranges0) when is_list(Ranges0) ->
 get_char_info(Chars0, Font) ->
     MDC = memory_dc(Font),
     Info = get_char_info(Chars0, MDC, Font, 0, 0, []),
-    wxMemoryDC:destroy(MDC),
-    io:format("~p~n",[Info]),
+    destroy_dc(MDC),
     Info.
 
 get_char_info([Char|Cs], DC, Font, W0, H0, Acc) ->
-    {W, H, _, _} = wxDC:getTextExtent(DC, [Char], [{theFont, Font}]),
+    {W, H} = getTextExtent(DC, [Char]),
     get_char_info(Cs, DC, Font, max(W,W0), max(H,H0), [{W,H,Char}|Acc]);
 get_char_info([], _, _, W, H, Acc) ->
     {W, H, lists:keysort(2, Acc)}.
 
 make_glyphs(Font,Chars,H, TW,TH) ->
-    MDC = memory_dc(Font),
     Bitmap = wxBitmap:new(TW, TH, [{depth,32}]),
-    ok = wxMemoryDC:selectObject(MDC, Bitmap),
-
-    BG = {0, 0, 0, 0},
-    Brush = wxBrush:new(BG, [{style, ?wxSOLID}]),
-    wxMemoryDC:setBackground(MDC, Brush),
-    wxMemoryDC:clear(MDC),
-
-    FG = {255, 255, 255, 255},
-    wxMemoryDC:setTextForeground(MDC, FG),
-    wxMemoryDC:setTextBackground(MDC, BG),
+    MDC = memory_dc(Font, Bitmap),
     Glyphs = make_glyphs(MDC, Chars, 0, 0, H, TW, TH, array:new()),
+    destroy_dc(MDC),
+
     Image = wxBitmap:convertToImage(Bitmap),
     debug(Image),  
 
     BinData = wxImage:getData(Image),
     Alpha = case wxImage:hasAlpha(Image) of
 		true ->
-		    %%io:format("A = ~p ~n", [wxImage:hasAlpha(Image)]),
+		    io:format("A = ~p ~n", [wxImage:hasAlpha(Image)]),
 		    wxImage:getAlpha(Image);
 		false ->
 		    false
 	    end,
 
-    wxBrush:destroy(Brush),
     wxImage:destroy(Image),
     wxBitmap:destroy(Bitmap),
-    wxMemoryDC:destroy(MDC),
     greyscale(BinData, Alpha, Glyphs).
 
 %% Minimize texture space, use greyscale images
 greyscale(BinData, false, Glyphs) ->  %% Alpha use gray scale value
     Bin = << <<255:8, A:8>> || <<A:8,_:8,_:8>> <= BinData>>,
+    A = [A || <<_:8, A:8>> <= Bin, 1 < A, A < 254],
+    io:format("Alpha ~p~n", [length(A)]),
     {Bin, true, Glyphs};
 greyscale(BinData, Alpha, Glyphs) ->
+    A = [A || <<A:8>> <= Alpha, 1 < A, A < 254],
+    io:format("Alpha ~p~n", [length(A)]),
     {greyscale2(BinData, Alpha, <<>>), true, Glyphs}.
 
 greyscale2(<<R:8,_:8,_:8, Cs/bytes>>, <<A:8, As/bytes>>, Acc) ->
     greyscale2(Cs, As, <<Acc/bytes, R:8, A:8>>);
 greyscale2(<<>>, <<>>, Acc) ->
+    A = [A || <<_:8, A:8>> <= Acc, 1 < A, A < 254],
+    io:format("Grey ~p~n", [length(A)]),
     Acc.
 
 make_glyphs(DC, [Char|Chars], X, Y, H, TW, TH, Acc0) ->
@@ -223,7 +223,7 @@ make_glyph(DC, {Width, _H, Char}, X0, Y0, Height, TW, TH, Acc0) ->
 		    X  = Xt,  Y = Y0,
 		    X1 = X0, Y1 = Y0 
 	    end,
-	    wxMemoryDC:drawText(DC, [Char], {X1, Y1}),
+	    drawText(DC, [Char], {X1, Y1}),
 	    G = #glyph{w=Width, u=X1/TW, v=(Y1)/TH},
 	    {array:set(Char, G, Acc0), X+?SPACE_X, Y};
 	false ->
@@ -272,11 +272,6 @@ gen_texture(TW,TH,Bin,HaveAlpha,Options) ->
     gl:bindTexture(?GL_TEXTURE_2D, 0),
     TexId.
 
-
-memory_dc(Font) ->
-    MDC = wxMemoryDC:new(),
-    wxMemoryDC:setFont(MDC, Font),
-    MDC.
 
 render_text(Font, String) ->
     render_text2(Font, String),
@@ -398,6 +393,67 @@ check_pow2(NoX, W, Pow2) when NoX * W > Pow2 ->
     check_pow2(NoX, W, Pow2*2);
 check_pow2(NoX, W, Pow2) ->
     {trunc((Pow2 - NoX*W)/W), Pow2}.
+
+
+memory_dc(Font) ->
+    memory_dc(Font, wxBitmap:new(64,64)).
+
+memory_dc(Font, Bitmap) ->
+    MDC = wxMemoryDC:new(),
+    ok = wxMemoryDC:selectObject(MDC, Bitmap),
+    memory_gc(MDC, Font).
+
+memory_gc(MDC, Font) ->
+    Brush = wxBrush:new({0,0,0,0}, [{style, ?wxSOLID}]),
+    wxMemoryDC:setBackground(MDC, Brush),
+    wxMemoryDC:clear(MDC),
+    DC = case is_wx30() of
+	     true -> 
+		 GC = ?wxGC:create(wx:typeCast(MDC, wxWindowDC)),
+		 {gc, GC, MDC};
+	     false ->
+		 {dc, MDC}
+	 end,
+    setFont(DC, Font, ?WHITE, {255,255,255,0}),
+    DC.
+
+is_wx30() ->
+    true.
+
+destroy_dc({gc, GC, DC}) ->
+    ?wxGC:destroy(GC),
+    wxMemoryDC:destroy(DC);
+destroy_dc({dc, DC}) ->
+    wxMemoryDC:destroy(DC).
+
+setPen({dc, DC}, Pen) ->
+    wxDC:setPen(DC, Pen);
+setPen({gc, GC, _}, Pen) ->
+    ?wxGC:setPen(GC, Pen).
+
+setFont({dc, DC}, Font, FG, BG) ->
+    wxDC:setTextForeground(DC, FG),
+    wxDC:setTextBackground(DC, BG),
+    wxDC:setFont(DC, Font);
+setFont({gc, GC, _}, Font, FG, _BG) ->
+    ?wxGC:setFont(GC, Font, FG).
+
+setBrush({dc, DC}, Brush) ->
+    wxDC:setBrush(DC, Brush);
+setBrush({gc, GC, _}, Brush) ->
+    ?wxGC:setBrush(GC, Brush).
+
+drawText({dc, DC}, Str, {X, Y}) ->
+    wxDC:drawText(DC, Str, {round(X),round(Y)});
+drawText({gc, GC, _}, Str, {X, Y}) ->
+    ?wxGC:drawText(GC, Str, X, Y).
+
+getTextExtent({dc, DC}, Str) ->
+    wxDC:getTextExtent(DC, Str);
+getTextExtent({gc, GC, _}, Str) ->
+    {W,H,_,_} = ?wxGC:getTextExtent(GC, Str),
+    {W,H}.
+
 
 debug(Image0) ->
     Image = wxImage:copy(Image0),
