@@ -31,7 +31,7 @@
 -include_lib("wx/include/wx.hrl").
 -include_lib("wx/include/gl.hrl").
 
--record(glyph, {u, v, w}).
+-record(glyph, {u, v, w, h}).
 -record(font,  {wx, tex, glyphs, height, ih, iw}).
 
 -define(F32, 32/float-native).
@@ -64,8 +64,7 @@ load_font(WxFont) ->
 load_font(WxFont, Options) ->
     case wxFont:ok(WxFont) of
 	true ->
-	    {Height, AWidth} = get_height(WxFont), 
-	    GLFont = gen_glfont(WxFont, AWidth, Height, Options),
+	    GLFont = gen_glfont(WxFont, Options),
 	    {ok, GLFont};
 	false ->
 	    {error, not_ok}
@@ -132,25 +131,36 @@ render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW},
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-gen_glfont(Font, AW, H, Options) ->
+gen_glfont(Font, Options) ->
     Ranges0 = proplists:get_value(range, Options, [{32, 256}]),
-    {NoChars, Ranges} = char_ranges(Ranges0),
-    {TW,TH} = calc_tex_size(NoChars, AW, H),
+    {NoChars, Chars0} = all_chars(Ranges0),
+    {W, H, Chars} = get_char_info(Chars0, Font), 
+    {TW,TH} = calc_tex_size(NoChars, W, H),
     %% io:format("Tex Sz: ~p ~p ~n",[TW,TH]),
-    {Bin, HaveAlpha, Glyphs} = make_glyphs(Font,Ranges,H,TW,TH),
+    {Bin, HaveAlpha, Glyphs} = make_glyphs(Font,Chars,H,TW,TH),
     TexId = gen_texture(TW,TH,Bin,HaveAlpha,Options),
-    
-    #font{wx=Font, tex=TexId, glyphs=Glyphs, height=H, ih=H/TH, iw=1/TW}.
+ 
+    #font{wx=Font, tex=TexId, glyphs=Glyphs, height=H, ih=1/TH, iw=1/TW}.
 
-char_ranges(Ranges0) when is_list(Ranges0) ->
-    Ranges = lists:sort(Ranges0),
-    Count = lists:foldl(fun({From, To}, Count) when From =< To ->
-				Count + (To - From)
-			end, 0, Ranges),
-    {Count, Ranges}.
-    
+all_chars(Ranges0) when is_list(Ranges0) ->
+    Ranges1 = lists:sort(Ranges0),
+    Ranges = [lists:seq(Min,Max) || {Min, Max} <- Ranges1, Min =< Max],
+    Chars = lists:usort(lists:append(Ranges)),
+    {length(Chars), Chars}.
 
-make_glyphs(Font,Ranges,H, TW,TH) ->
+get_char_info(Chars0, Font) ->
+    MDC = memory_dc(Font),
+    Info = get_char_info(Chars0, MDC, Font, 0, 0, []),
+    wxMemoryDC:destroy(MDC),
+    Info.
+
+get_char_info([Char|Cs], DC, Font, W0, H0, Acc) ->
+    {W, H, _, _} = wxDC:getTextExtent(DC, [Char], [{theFont, Font}]),
+    get_char_info(Cs, DC, Font, max(W,W0), max(H,H0), [{W,H,Char}|Acc]);
+get_char_info([], _, _, W, H, Acc) ->
+    {W, H, lists:keysort(2, Acc)}.
+
+make_glyphs(Font,Chars,H, TW,TH) ->
     MDC = memory_dc(Font),
     Bitmap = wxBitmap:new(TW, TH, [{depth,32}]),
     ok = wxMemoryDC:selectObject(MDC, Bitmap),
@@ -163,9 +173,9 @@ make_glyphs(Font,Ranges,H, TW,TH) ->
     FG = {255, 255, 255, 255},
     wxMemoryDC:setTextForeground(MDC, FG),
     wxMemoryDC:setTextBackground(MDC, BG),
-    Glyphs = make_glyphs(MDC, Ranges, 0, 0, H, TW, TH, array:new()),
+    Glyphs = make_glyphs(MDC, Chars, 0, 0, H, TW, TH, array:new()),
     Image = wxBitmap:convertToImage(Bitmap),
-    %% debug(Image),  
+    debug(Image),  
 
     BinData = wxImage:getData(Image),
     Alpha = case wxImage:hasAlpha(Image) of
@@ -194,30 +204,26 @@ greyscale2(<<R:8,_:8,_:8, Cs/bytes>>, <<A:8, As/bytes>>, Acc) ->
 greyscale2(<<>>, <<>>, Acc) ->
     Acc.
 
-make_glyphs(DC, [{From, To}|Ranges], X, Y, H, TW, TH, Acc0)
-  when From < To ->
-    {Acc,Xp,Yp} = make_glyph(DC, From, X, Y, H, TW, TH, Acc0),
-    make_glyphs(DC, [{From+1, To}|Ranges], Xp, Yp, H, TW, TH, Acc);
-make_glyphs(DC, [_|Ranges], X, Y, H, TW, TH, Acc) ->
-    make_glyphs(DC, Ranges, X, Y, H, TW, TH, Acc);
+make_glyphs(DC, [Char|Chars], X, Y, H, TW, TH, Acc0) ->
+    {Acc,Xp,Yp} = make_glyph(DC, Char, X, Y, H, TW, TH, Acc0),
+    make_glyphs(DC, Chars, Xp, Yp, H, TW, TH, Acc);
 make_glyphs(_DC, [], _X, _Y, _H, _TW, _TH, Acc) ->
     Acc.
 
-make_glyph(DC, Char, X0, Y0, Height, TW, TH, Acc0) ->
-    {Width, _H} = wxDC:getTextExtent(DC, [Char]),
+make_glyph(DC, {Width, CharH, Char}, X0, Y0, Height, TW, TH, Acc0) ->
     Xt = X0+Width,
     case (Y0 + Height) =< TH of
 	true -> %% Assert that we fit inside texture
 	    case Xt > TW of
-		true -> 
-		    X = Width,  Y = Y0+Height+?SPACE_Y,
+		true ->
+		    X = Width,  Y = Y0+CharH+?SPACE_Y,
 		    X1 = 0, Y1 = Y;
 		false ->
 		    X  = Xt,  Y = Y0,
-		    X1 = X0, Y1 = Y0 
+		    X1 = X0, Y1 = Y0
 	    end,
 	    wxMemoryDC:drawText(DC, [Char], {X1, Y1}),
-	    G = #glyph{w=Width, u=X1/TW, v=(Y1)/TH},
+	    G = #glyph{w=Width, h=CharH, u=X1/TW, v=(Y1)/TH},
 	    {array:set(Char, G, Acc0), X+?SPACE_X, Y};
 	false ->
 	    io:format("Tex ~p,~p to small Ignore Char ~p(~ts)~n",
@@ -265,12 +271,6 @@ gen_texture(TW,TH,Bin,HaveAlpha,Options) ->
     gl:bindTexture(?GL_TEXTURE_2D, 0),
     TexId.
 
-get_height(Font) ->
-    MDC = memory_dc(Font),
-    Height = wxMemoryDC:getCharHeight(MDC),
-    AverW  = wxMemoryDC:getCharWidth(MDC),
-    wxMemoryDC:destroy(MDC),
-    {Height, AverW}.
 
 memory_dc(Font) ->
     MDC = wxMemoryDC:new(),
@@ -302,7 +302,7 @@ render_text2(#font{tex=TexId, glyphs=Gs, height=H, ih=IH, iw=IW}, String) ->
 render_text3([Char|String], Gs, IH, IW, H, Data0) when is_integer(Char) ->
     case array:get(Char, Gs) of
 	#glyph{}=Glyph ->
-	    Data = render_glyph(Glyph,H,IW,IH,Data0), 
+	    Data = render_glyph(Glyph,IW,IH,Data0),
 	    render_text3(String, Gs, IH, IW, H, Data);
 	undefined when Char =:= 10 -> %% NL
 	    {_,H0,Bin} = Data0,
@@ -310,7 +310,7 @@ render_text3([Char|String], Gs, IH, IW, H, Data0) when is_integer(Char) ->
 	undefined when Char =:= 9 -> %% TAB
 	    Space = array:get(32, Gs),
 	    Data  = lists:foldl(fun(_, Data) ->
-					render_glyph(Space,H,IW,IH,Data)
+					render_glyph(Space,IW,IH,Data)
 				end, Data0, "        "),
 	    render_text3(String, Gs, IH, IW, H, Data);
 	undefined -> %% Should we render something strange here
@@ -324,30 +324,19 @@ render_text3(Bin, Gs, IH, IW, H, Data) when is_binary(Bin) ->
 render_text3([], _Gs, _IH, _IW, _H, {W,H0,Bin}) ->
     {W, H0, <<Bin/bytes, 0:(?BIN_XTRA*8)>>}.
 
-render_glyph(#glyph{u=U,v=V,w=W},H,IW,IH, {X0,Y0,Bin}) -> 
+render_glyph(#glyph{u=U,v=V,w=W,h=H},IW,IH, {X0,Y0,Bin}) ->
     X1 = X0 + W,
     UD = U + W*IW,
-    VD = V + IH,
+    VD = V + H*IH,
     YH = Y0+H,
     {X1,Y0,
-     <<Bin/binary,         %% wxImage: 0,0 is upper left turn each 
+     <<Bin/binary,         %% wxImage: 0,0 is upper left turn each
        X0:?F32,Y0:?F32, U:?F32, VD:?F32, % Vertex lower left, UV-coord up-left
        X1:?F32,Y0:?F32, UD:?F32,VD:?F32, % Vertex lower right,UV-coord up-right
        X1:?F32,YH:?F32, UD:?F32, V:?F32, % Vertex upper right,UV-coord down-right
        X0:?F32,YH:?F32, U:?F32,  V:?F32  % Vertex upper left, UV-coord down-left
      >>
     }.
-
-%% The code above is the same as the code below.
-%% render_glyph(#glyph{u=U,v=V,w=W},X0,H,IW,IH) -> 
-%%     X1 = X0 + W,
-%%     UD = U + (W-1)*IW,
-%%     VD = V + IH,
-%%     gl:texCoord2f(U,  VD),  gl:vertex2i(X0, 0),
-%%     gl:texCoord2f(UD, VD),  gl:vertex2i(X1, 0),
-%%     gl:texCoord2f(UD, V), gl:vertex2i(X1, H),
-%%     gl:texCoord2f(U,  V), gl:vertex2i(X0, H),
-%%     X1.
 
 %% Calculate texture size
 
