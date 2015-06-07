@@ -64,8 +64,7 @@ load_font(WxFont) ->
 load_font(WxFont, Options) ->
     case wxFont:ok(WxFont) of
 	true ->
-	    {Height, AWidth} = get_height(WxFont), 
-	    GLFont = gen_glfont(WxFont, AWidth, Height, Options),
+	    GLFont = gen_glfont(WxFont, Options),
 	    {ok, GLFont};
 	false ->
 	    {error, not_ok}
@@ -132,25 +131,37 @@ render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW},
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
-gen_glfont(Font, AW, H, Options) ->
+gen_glfont(Font, Options) ->
     Ranges0 = proplists:get_value(range, Options, [{32, 256}]),
-    {NoChars, Ranges} = char_ranges(Ranges0),
-    {TW,TH} = calc_tex_size(NoChars, AW, H),
+    {NoChars, Chars0} = all_chars(Ranges0),
+    {W, H, Chars} = get_char_info(Chars0, Font), 
+    {TW,TH} = calc_tex_size(NoChars, W, H),
     %% io:format("Tex Sz: ~p ~p ~n",[TW,TH]),
-    {Bin, HaveAlpha, Glyphs} = make_glyphs(Font,Ranges,H,TW,TH),
+    {Bin, HaveAlpha, Glyphs} = make_glyphs(Font,Chars,H,TW,TH),
     TexId = gen_texture(TW,TH,Bin,HaveAlpha,Options),
-    
+ 
     #font{wx=Font, tex=TexId, glyphs=Glyphs, height=H, ih=H/TH, iw=1/TW}.
 
-char_ranges(Ranges0) when is_list(Ranges0) ->
-    Ranges = lists:sort(Ranges0),
-    Count = lists:foldl(fun({From, To}, Count) when From =< To ->
-				Count + (To - From)
-			end, 0, Ranges),
-    {Count, Ranges}.
-    
+all_chars(Ranges0) when is_list(Ranges0) ->
+    Ranges1 = lists:sort(Ranges0),
+    Ranges = [lists:seq(Min,Max) || {Min, Max} <- Ranges1, Min =< Max],
+    Chars = lists:usort(lists:append(Ranges)),
+    {length(Chars), Chars}.
 
-make_glyphs(Font,Ranges,H, TW,TH) ->
+get_char_info(Chars0, Font) ->
+    MDC = memory_dc(Font),
+    Info = get_char_info(Chars0, MDC, Font, 0, 0, []),
+    wxMemoryDC:destroy(MDC),
+    io:format("~p~n",[Info]),
+    Info.
+
+get_char_info([Char|Cs], DC, Font, W0, H0, Acc) ->
+    {W, H, _, _} = wxDC:getTextExtent(DC, [Char], [{theFont, Font}]),
+    get_char_info(Cs, DC, Font, max(W,W0), max(H,H0), [{W,H,Char}|Acc]);
+get_char_info([], _, _, W, H, Acc) ->
+    {W, H, lists:keysort(2, Acc)}.
+
+make_glyphs(Font,Chars,H, TW,TH) ->
     MDC = memory_dc(Font),
     Bitmap = wxBitmap:new(TW, TH, [{depth,32}]),
     ok = wxMemoryDC:selectObject(MDC, Bitmap),
@@ -163,9 +174,9 @@ make_glyphs(Font,Ranges,H, TW,TH) ->
     FG = {255, 255, 255, 255},
     wxMemoryDC:setTextForeground(MDC, FG),
     wxMemoryDC:setTextBackground(MDC, BG),
-    Glyphs = make_glyphs(MDC, Ranges, 0, 0, H, TW, TH, array:new()),
+    Glyphs = make_glyphs(MDC, Chars, 0, 0, H, TW, TH, array:new()),
     Image = wxBitmap:convertToImage(Bitmap),
-    %% debug(Image),  
+    debug(Image),  
 
     BinData = wxImage:getData(Image),
     Alpha = case wxImage:hasAlpha(Image) of
@@ -194,17 +205,13 @@ greyscale2(<<R:8,_:8,_:8, Cs/bytes>>, <<A:8, As/bytes>>, Acc) ->
 greyscale2(<<>>, <<>>, Acc) ->
     Acc.
 
-make_glyphs(DC, [{From, To}|Ranges], X, Y, H, TW, TH, Acc0)
-  when From < To ->
-    {Acc,Xp,Yp} = make_glyph(DC, From, X, Y, H, TW, TH, Acc0),
-    make_glyphs(DC, [{From+1, To}|Ranges], Xp, Yp, H, TW, TH, Acc);
-make_glyphs(DC, [_|Ranges], X, Y, H, TW, TH, Acc) ->
-    make_glyphs(DC, Ranges, X, Y, H, TW, TH, Acc);
+make_glyphs(DC, [Char|Chars], X, Y, H, TW, TH, Acc0) ->
+    {Acc,Xp,Yp} = make_glyph(DC, Char, X, Y, H, TW, TH, Acc0),
+    make_glyphs(DC, Chars, Xp, Yp, H, TW, TH, Acc);
 make_glyphs(_DC, [], _X, _Y, _H, _TW, _TH, Acc) ->
     Acc.
 
-make_glyph(DC, Char, X0, Y0, Height, TW, TH, Acc0) ->
-    {Width, _H} = wxDC:getTextExtent(DC, [Char]),
+make_glyph(DC, {Width, _H, Char}, X0, Y0, Height, TW, TH, Acc0) ->
     Xt = X0+Width,
     case (Y0 + Height) =< TH of
 	true -> %% Assert that we fit inside texture
@@ -265,12 +272,6 @@ gen_texture(TW,TH,Bin,HaveAlpha,Options) ->
     gl:bindTexture(?GL_TEXTURE_2D, 0),
     TexId.
 
-get_height(Font) ->
-    MDC = memory_dc(Font),
-    Height = wxMemoryDC:getCharHeight(MDC),
-    AverW  = wxMemoryDC:getCharWidth(MDC),
-    wxMemoryDC:destroy(MDC),
-    {Height, AverW}.
 
 memory_dc(Font) ->
     MDC = wxMemoryDC:new(),
