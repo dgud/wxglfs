@@ -52,14 +52,15 @@ load_font(WxFont) ->
     load_font(WxFont, []).
 
 %% @spec(::wxFont(), [Options]) -> font_info() | {error, Reason}
-%% Option = {range, [{CS1,CE1},...]} | 
-%%              {tex_mode,GL_MODE} | 
+%% Option = {range, [{CS1,CE1},...]} |
+%%            {pots, false} | %% where POTS=PowerOfTwoTextureS
+%%              {tex_mode,GL_MODE} |
 %%              {tex_min, MinFilter} | {tex_mag, MagFilter}
 %%              {tex_wrap_s, WrapS}  | {tex_wrap_s, WrapS}
 %%              {tex_gen_mipmap, ?GL_TRUE|?GL_FALSE}
 %% @desc Prepare a font to be used in a wxGLCANVAS.
 %% Renders each character in the range into a texture.
-%% Range is a list of unicode code points ranges to be used when 
+%% Range is a list of unicode code points ranges to be used when
 %% rendering, default [{32, 256}].
 load_font(WxFont, Options) ->
     case wxFont:ok(WxFont) of
@@ -123,8 +124,8 @@ render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW}, String) ->
 %%     gl:enableClientState(?GL_VERTEX_ARRAY),</br>
 %%     gl:enableClientState(?GL_TEXTURE_COORD_ARRAY),</br>
 %%     gl:drawArrays(?GL_QUADS, 0, (byte_size(Bin)-?BIN_XTRA) div 16),</br>
-render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW}, 
-		 String, Data = {W,H,D}) 
+render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW},
+		 String, Data = {W,H,D})
   when is_integer(W), is_integer(H), is_binary(D) ->
     render_text3(String, Gs, IH, IW, H, Data).
 
@@ -134,12 +135,20 @@ render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW},
 gen_glfont(Font, Options) ->
     Ranges0 = proplists:get_value(range, Options, [{32, 256}]),
     {NoChars, Chars0} = all_chars(Ranges0),
-    {W, H, Chars} = get_char_info(Chars0, Font), 
-    {TW,TH} = calc_tex_size(NoChars, W, H),
-    %% io:format("Tex Sz: ~p ~p ~n",[TW,TH]),
-    {Bin, HaveAlpha, Glyphs} = make_glyphs(Font,Chars,H,TW,TH),
+    {W, H, Chars} = get_char_info(Chars0, Font),
+    {TW,TH0} = calc_tex_size(NoChars, W, H),
+    {UsedHeight, {Bin, HaveAlpha, Glyphs0}} = make_glyphs(Font,Chars,H,TW,TH0),
+    TH = case proplists:get_value(pots, Options, false) of
+	     true  -> TH0;
+	     false ->
+		 case UsedHeight rem 4 of %% Make it rem 4 for compression
+		     0 -> UsedHeight;
+		     Diff -> UsedHeight + 4-Diff
+		 end
+	 end,
+    Glyphs = recalc_glyphs(Glyphs0, TH0, TH),
+    %% debug(TW,TH,Bin),
     TexId = gen_texture(TW,TH,Bin,HaveAlpha,Options),
- 
     #font{wx=Font, tex=TexId, glyphs=Glyphs, height=H, ih=1/TH, iw=1/TW}.
 
 all_chars(Ranges0) when is_list(Ranges0) ->
@@ -160,6 +169,12 @@ get_char_info([Char|Cs], DC, Font, W0, H0, Acc) ->
 get_char_info([], _, _, W, H, Acc) ->
     {W, H, lists:keysort(2, Acc)}.
 
+
+recalc_glyphs(Glyphs, TH, TH) -> Glyphs;
+recalc_glyphs(Glyphs, Old, New) ->
+    Recalc = fun(_, G=#glyph{v=V0}) -> G#glyph{v=V0*Old/New} end,
+    array:sparse_map(Recalc, Glyphs).
+
 make_glyphs(Font,Chars,H, TW,TH) ->
     MDC = memory_dc(Font),
     Bitmap = wxBitmap:new(TW, TH, [{depth,32}]),
@@ -173,9 +188,8 @@ make_glyphs(Font,Chars,H, TW,TH) ->
     FG = {255, 255, 255, 255},
     wxMemoryDC:setTextForeground(MDC, FG),
     wxMemoryDC:setTextBackground(MDC, BG),
-    Glyphs = make_glyphs(MDC, Chars, 0, 0, H, TW, TH, array:new()),
+    {UsedHeight,Glyphs} = make_glyphs(MDC, Chars, 0, 0, H, TW, TH, array:new()),
     Image = wxBitmap:convertToImage(Bitmap),
-    debug(Image),  
 
     BinData = wxImage:getData(Image),
     Alpha = case wxImage:hasAlpha(Image) of
@@ -190,7 +204,7 @@ make_glyphs(Font,Chars,H, TW,TH) ->
     wxImage:destroy(Image),
     wxBitmap:destroy(Bitmap),
     wxMemoryDC:destroy(MDC),
-    greyscale(BinData, Alpha, Glyphs).
+    {UsedHeight, greyscale(BinData, Alpha, Glyphs)}.
 
 %% Minimize texture space, use greyscale images
 greyscale(BinData, false, Glyphs) ->  %% Alpha use gray scale value
@@ -207,8 +221,8 @@ greyscale2(<<>>, <<>>, Acc) ->
 make_glyphs(DC, [Char|Chars], X, Y, H, TW, TH, Acc0) ->
     {Acc,Xp,Yp} = make_glyph(DC, Char, X, Y, H, TW, TH, Acc0),
     make_glyphs(DC, Chars, Xp, Yp, H, TW, TH, Acc);
-make_glyphs(_DC, [], _X, _Y, _H, _TW, _TH, Acc) ->
-    Acc.
+make_glyphs(_DC, [], _X, Y, H, _TW, _TH, Acc) ->
+    {Y+H+?SPACE_Y, Acc}.
 
 make_glyph(DC, {Width, CharH, Char}, X0, Y0, Height, TW, TH, Acc0) ->
     Xt = X0+Width,
@@ -362,13 +376,12 @@ calc_tex_size(X, Y, No, CW, CH, Prev = {BestArea,Dec}, BestCoord)
     end;
 calc_tex_size(_, _, _, _, _, _, BestCoord) ->
     BestCoord.
-    
 
 floor(T,N) ->
     X = T div N,
     if (T rem N) =:= 0 ->
 	    X;
-       true -> 
+       true ->
 	    X+1
     end.
 
@@ -378,7 +391,7 @@ tsize(X0) ->
 	X0 -> X0;
 	_ -> 1 bsl (Pow+1)
     end.
-  
+
 log2(X) ->
     math:log(X) / math:log(2).
 
@@ -387,18 +400,19 @@ check_pow2(NoX, W, Pow2) when NoX * W > Pow2 ->
 check_pow2(NoX, W, Pow2) ->
     {trunc((Pow2 - NoX*W)/W), Pow2}.
 
-debug(Image0) ->
-    Image = wxImage:copy(Image0),
-    W = wxImage:getWidth(Image),
-    H = wxImage:getHeight(Image),
-    Frame = wxFrame:new(wx:null(), ?wxID_ANY, "DEBUG", [{size, {W+10, H+10}}]),
+debug(W,H, Bin0) ->
+    Bin = << <<G:8, G:8, G:8>> || <<_:8, G:8>> <= Bin0>>,
+    Image = wxImage:new(W,H,Bin),
+    Title = io_lib:format("DEBUG ~px~p", [W,H]),
+    Frame = wxFrame:new(wx:null(), ?wxID_ANY, Title, [{size, {W+10, H+10}}]),
     Panel = wxPanel:new(Frame),
-    Paint = fun(_,_) ->	    
+    Paint = fun(_,_) ->
 		    DC=wxPaintDC:new(Panel),
 		    Bmp = wxBitmap:new(Image),
 		    wxDC:drawBitmap(DC, Bmp, {0,0}),
 		    wxPaintDC:destroy(DC),
 		    wxBitmap:destroy(Bmp)
 	    end,
+    %% wxImage:destroy(Image),
     wxFrame:connect(Panel, paint, [{callback, Paint}]),
     wxFrame:show(Frame).
