@@ -31,13 +31,13 @@ init() ->
 			      ?WX_GL_DEPTH_SIZE, 24, 0]}],
     GL = wxGLCanvas:new(Frame, Opts ++ GLAttrib),
 
-    wxFrame:connect(Frame, enter_window),
+%    wxFrame:connect(Frame, enter_window),
     wxFrame:connect(Frame, close_window),
     wxFrame:connect(Frame, show),
     %% wxFrame:connect(Frame, key_up),
-    wxFrame:connect(GL,    left_down),
-    wxFrame:connect(GL,    mousewheel),
-    wxFrame:connect(GL,    motion),
+%    wxFrame:connect(GL,    left_down),
+%    wxFrame:connect(GL,    mousewheel),
+%    wxFrame:connect(GL,    motion),
     
     wxFrame:show(Frame),
     receive #wx{event=#wxShow{}} -> ok end,
@@ -84,10 +84,14 @@ loop(State) ->
 	    wx:destroy();
 	#wx{event=#wxMouse{type=right_up}} ->
 	    New = get_font(State),
-	    loop(New)
+	    loop(New);
+	#wx{} ->
+	    loop(State)
     after 0 ->
 	    wx:batch(fun() -> hello(State) end),
 	    wxGLCanvas:swapBuffers(State#state.gl),
+	    _Sync = wxWindow:getSize(State#state.gl),
+	    timer:sleep(5),
 	    NRot = (State#state.rot + 2) rem 360,
 	    loop(State#state{rot=NRot})
     end.
@@ -128,14 +132,15 @@ test1(State = #state{font20=Font}) ->
 
 test2(State) ->
     set_model_view(),
-    gl:rotatef(-45, 0, 1, 0),
-    gl:translatef(-1.0, -0.5, 0),
+    gl:rotatef(180, 1, 0, 0),
+    gl:rotatef(45, 0, 0, 1),
+    gl:translatef(-1.5, 0.5, 0),
 
     {Size, List} = State#state.list,
     scale(Size),
 
     gl:color3ub(0, 0, 255),
-    gl:callList(List).    
+    gl:callList(List).
 
 set_model_view() ->
     gl:matrixMode(?GL_MODELVIEW),
@@ -152,23 +157,23 @@ test3(#state{gl=GL, file=File, font10=Font}) ->
     gl:matrixMode(?GL_PROJECTION),
     gl:pushMatrix(),
     gl:loadIdentity(),
-    glu:ortho2D(0, W, 0, H),
+    glu:ortho2D(0, W, H, 0),
     gl:matrixMode(?GL_MODELVIEW),
     gl:pushMatrix(),
     gl:loadIdentity(),
     TextH = float(wx_glfont:height(Font)),
-    gl:translatef(30.0, H-30.0-TextH, 0.0),
+    gl:translatef(30.0, 30.0, 0.0),
     wx_glfont:render(Font, "This is a fixed font in size 10"),
-    gl:translatef(0.0, -TextH, 0.0),
+    gl:translatef(0.0, TextH, 0.0),
     wx_glfont:render(Font, "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"),
-    gl:translatef(0.0, -TextH, 0.0),
+    gl:translatef(0.0, TextH, 0.0),
     wx_glfont:render(Font, [72,101,98,114,101,119,32,32,32,32,
 			    [1513,1500,1493,1501],
 			    32,45,45,32,74,97,112,
 			    <<97:8,110:8,101:8,115:8,101:8,32:8,40:8>>,
 			    [26085,26412,35486],41,10]),
 
-    gl:translatef(0.0, -5*TextH, 0.0),
+    gl:translatef(0.0, 5*TextH, 0.0),
     wx_glfont:render(Font, File),
     gl:popMatrix(),
     gl:matrixMode(?GL_PROJECTION),

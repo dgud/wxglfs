@@ -1,11 +1,15 @@
-%%%-------------------------------------------------------------------
-%%% File    : wx_glfont.erl
-%%% Author  : Olivier <olivier@biniou.info> 
-%%%           Dan Gudmundsson <dgud@erlang.org>
-%%% Description : OpenGL text rendering using wxFont
-%%%
-%%% Created : 27 Aug 2009 by Olivier <olivier@biniou.info>
-%%%-------------------------------------------------------------------
+%%
+%%  wings_glfont.erl --
+%%
+%%     Text and font support.
+%%
+%%  Copyright (c) 2009-2015 Dan Gudmundsson
+%%
+%%  Some ideas and code from Olivier Girondel
+%%
+%%  See the file "license.terms" for information on usage and redistribution
+%%  of this file, and for a DISCLAIMER OF ALL WARRANTIES.
+%%
 %%%
 %%% @doc A api for generating textures and rendering strings via opengl.
 %%%
@@ -13,8 +17,8 @@
 %%% #wxFont{}. The textures are white on black with an alpha channel.
 %%% The default mode for the texture created is ?GL_MODULATE.
 %%% That way you can use gl:color3x to specify the color of the text.
-%%% 
-%%% This is a low level interface a library the intention is that 
+%%%
+%%% This is a low level interface a library the intention is that
 %%% you should be able to use it to build a text rendering interface
 %%% above that changes fonts and colors and maybe even sizes.
 
@@ -22,8 +26,8 @@
 
 %% API
 -export([load_font/1, load_font/2,
-	 text_size/2, height/1, tex_id/1,
-	 render/2, render_to_list/2, 
+	 text_size/2, width/1, height/1, tex_id/1,
+	 render/2, render_to_list/2,
 	 render_to_binary/2, render_to_binary/3]).
 
 -compile(export_all).
@@ -32,12 +36,12 @@
 -include_lib("wx/include/gl.hrl").
 
 -record(glyph, {u, v, w, h}).
--record(font,  {wx, tex, glyphs, height, ih, iw}).
+-record(font,  {wx, tex, glyphs, height, width, ih, iw}).
 
 -define(F32, 32/float-native).
 -define(SPACE_X, 3).  % Space between chars
 -define(SPACE_Y, 2).  % Space between rows
--define(BIN_XTRA, 0). %% Safe off-heap alloc
+-define(BIN_XTRA, (64+16)). %% Safe off-heap alloc
 
 
 %%====================================================================
@@ -79,10 +83,16 @@ text_size(#font{wx=Font}, String) ->
     wxMemoryDC:destroy(MDC),
     Size.
 
-%% @spec(font_info()) -> {integer(), integer()}.
+%% @spec(font_info()) -> integer().
 %% @desc Returns the height of characters and rows.
 height(#font{height=Height}) ->
     Height.
+
+%% @spec(font_info()) -> integer().
+%% @desc Returns the Width of characters.
+width(#font{width=W}) ->
+    W.
+
 
 %% @spec(font_info()) -> integer()
 %% @desc Returns the texture id.
@@ -91,26 +101,46 @@ tex_id(#font{tex=TexId}) ->
 
 %% @spec(font_info(), unicode:charlist()) -> ok.
 %% @desc Directly renders the string.
-render(#font{} = GLFont, String) ->
-    render_text(GLFont, String).
+render(#font{} = GLFont, String) when is_list(String) ->
+    render_text(GLFont, String);
+render(#font{}, {_, _, <<>>}) -> ok;
+render(#font{tex=TexId, height=H}, {X,Y, Bin0}) ->
+    Size = byte_size(Bin0),
+    Bin = <<_:2/unit:32, TxBin/bytes>> =
+	if Size < ?BIN_XTRA -> <<Bin0/bytes, 0:(?BIN_XTRA*8)>>;
+	   true -> Bin0
+	end,
+
+    wx:retain_memory(Bin),
+    gl:bindTexture(?GL_TEXTURE_2D, TexId),
+    gl:vertexPointer(2, ?GL_FLOAT, 16, Bin),
+    gl:texCoordPointer(2, ?GL_FLOAT, 16, TxBin),
+    gl:enableClientState(?GL_VERTEX_ARRAY),
+    gl:enableClientState(?GL_TEXTURE_COORD_ARRAY),
+    gl:drawArrays(?GL_QUADS, 0, Size div 16),
+    gl:disableClientState(?GL_VERTEX_ARRAY),
+    gl:disableClientState(?GL_TEXTURE_COORD_ARRAY),
+    wx:release_memory(Bin),
+    {X,abs(Y-H)}.
+
 
 %% @spec(font_info(), unicode:charlist()) -> {Size::size(), DisplayList::integer()}.
 %% @desc Renders the string.
 render_to_list(#font{} = Font, String) ->
     List = gl:genLists(1),
     gl:newList(List, ?GL_COMPILE),
-    Res = render_text2(Font, String),
+    Res = render_text(Font, String),
     gl:endList(),
-    {Res, List}.    
+    {Res, List}.
 
-%% @spec(Font::font_info(), unicode:charlist()) -> 
+%% @spec(Font::font_info(), unicode:charlist()) ->
 %%       {W::integer(), H::integer(), binary()}.
 %% @desc Renders the string to an interleaved vertex array.
 %% @equiv render_to_binary(Font, String, {0,0,<<>>}).
 render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW}, String) ->
     render_text3(String, Gs, IH, IW, H, {0,0, <<>>}).
 
-%% @spec(Font::font_info(), unicode:charlist(), {X0,Y0,Bin}) -> 
+%% @spec(Font::font_info(), unicode:charlist(), {X0,Y0,Bin}) ->
 %%       {X::integer(), Y::integer(), Bin::binary()}.
 %% @desc Renders the string to an interleaved vertex array.
 %% The render starts at position X0 and Y0 and appends to Bin,
@@ -125,8 +155,8 @@ render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW}, String) ->
 %%     gl:enableClientState(?GL_TEXTURE_COORD_ARRAY),</br>
 %%     gl:drawArrays(?GL_QUADS, 0, (byte_size(Bin)-?BIN_XTRA) div 16),</br>
 render_to_binary(#font{glyphs=Gs, height=H, ih=IH, iw=IW},
-		 String, Data = {W,H,D})
-  when is_integer(W), is_integer(H), is_binary(D) ->
+		 String, Data = {X,Y,D})
+  when is_integer(X), is_integer(Y), is_binary(D) ->
     render_text3(String, Gs, IH, IW, H, Data).
 
 %%--------------------------------------------------------------------
@@ -138,23 +168,23 @@ gen_glfont(Font, Options) ->
     {W, H, Chars} = get_char_info(Chars0, Font),
     {TW,TH0} = calc_tex_size(NoChars, W, H),
     {UsedHeight, {Bin, HaveAlpha, Glyphs0}} = make_glyphs(Font,Chars,H,TW,TH0),
-    TH = case proplists:get_value(pots, Options, false) of
-	     true  -> TH0;
-	     false ->
-		 case UsedHeight rem 4 of %% Make it rem 4 for compression
-		     0 -> UsedHeight;
-		     Diff -> UsedHeight + 4-Diff
-		 end
-	 end,
-    Glyphs = recalc_glyphs(Glyphs0, TH0, TH),
-    %% debug(TW,TH,Bin),
+    TH = tex_size(Options, UsedHeight),
     TexId = gen_texture(TW,TH,Bin,HaveAlpha,Options),
-    #font{wx=Font, tex=TexId, glyphs=Glyphs, height=H, ih=1/TH, iw=1/TW}.
+    %% debug(TW,TH,Bin),
+    Glyphs = recalc_glyphs(Glyphs0, TH0, TH),
 
-all_chars(Ranges0) when is_list(Ranges0) ->
-    Ranges1 = lists:sort(Ranges0),
-    Ranges = [lists:seq(Min,Max) || {Min, Max} <- Ranges1, Min =< Max],
-    Chars = lists:usort(lists:append(Ranges)),
+    Tab = ets:new(font_chars, [public]),
+    ets:insert(Tab, array:sparse_to_orddict(Glyphs)),
+    #font{wx=Font, tex=TexId, glyphs=Tab,
+	  height=H, width=W, ih=1/TH, iw=1/TW}.
+
+all_chars(Ranges) when is_list(Ranges) ->
+    Chars0 = lists:foldl(fun({Min, Max}, Acc) when Min =< Max ->
+				 [lists:seq(Min, Max)|Acc];
+			    (Char, Acc) when is_integer(Char) ->
+				 [Char|Acc]
+			 end, [], Ranges),
+    Chars = lists:usort(lists:flatten(Chars0)),
     {length(Chars), Chars}.
 
 get_char_info(Chars0, Font) ->
@@ -168,7 +198,6 @@ get_char_info([Char|Cs], DC, Font, W0, H0, Acc) ->
     get_char_info(Cs, DC, Font, max(W,W0), max(H,H0), [{W,H,Char}|Acc]);
 get_char_info([], _, _, W, H, Acc) ->
     {W, H, lists:keysort(2, Acc)}.
-
 
 recalc_glyphs(Glyphs, TH, TH) -> Glyphs;
 recalc_glyphs(Glyphs, Old, New) ->
@@ -194,11 +223,11 @@ make_glyphs(Font,Chars,H, TW,TH) ->
     BinData = wxImage:getData(Image),
     Alpha = case wxImage:hasAlpha(Image) of
 		true ->
-		    %%io:format("A = ~p ~n", [wxImage:hasAlpha(Image)]),
 		    wxImage:getAlpha(Image);
 		false ->
 		    false
 	    end,
+    io:format("Alpha = ~p ~n", [wxImage:hasAlpha(Image)]),
 
     wxBrush:destroy(Brush),
     wxImage:destroy(Image),
@@ -244,7 +273,7 @@ make_glyph(DC, {Width, CharH, Char}, X0, Y0, Height, TW, TH, Acc0) ->
 		      [TW,TH,Char,[Char]]),
 	    {Acc0, X0, Y0}
     end.
-	    
+
 
 gen_texture(TW,TH,Bin,HaveAlpha,Options) ->
     [TexId] = gl:genTextures(1),
@@ -258,19 +287,19 @@ gen_texture(TW,TH,Bin,HaveAlpha,Options) ->
     gl:texParameterf(?GL_TEXTURE_2D,?GL_TEXTURE_MIN_FILTER,MinF),
     MagF = proplists:get_value(tex_mag, Options, ?GL_LINEAR),
     gl:texParameterf(?GL_TEXTURE_2D,?GL_TEXTURE_MAG_FILTER,MagF),
-    
+
     WS = proplists:get_value(tex_wrap_s, Options, ?GL_CLAMP),
     gl:texParameterf(?GL_TEXTURE_2D,?GL_TEXTURE_WRAP_S, WS),
     WT = proplists:get_value(tex_wrap_t, Options, ?GL_CLAMP),
-    gl:texParameterf(?GL_TEXTURE_2D,?GL_TEXTURE_WRAP_T, WT),    
+    gl:texParameterf(?GL_TEXTURE_2D,?GL_TEXTURE_WRAP_T, WT),
 
     GEN_MM = proplists:get_value(tex_gen_mipmap, Options, ?GL_FALSE),
     gl:texParameteri(?GL_TEXTURE_2D, ?GL_GENERATE_MIPMAP, GEN_MM),
     if GEN_MM == ?GL_TRUE ->
-	    gl:generateMipmapEXT(?GL_TEXTURE_2D);
+	    gl:generateMipmap(?GL_TEXTURE_2D);
        true -> ignore
     end,
-    
+
     %% io:format("HaveAlpha ~p ~n",[HaveAlpha]),
     case HaveAlpha of
 	true ->
@@ -291,43 +320,27 @@ memory_dc(Font) ->
     wxMemoryDC:setFont(MDC, Font),
     MDC.
 
-render_text(Font, String) ->
-    render_text2(Font, String),
-    ok.
+render_text(Font=#font{glyphs=Gs, height=H, ih=IH, iw=IW}, String) ->
+    Res = render_text3(String, Gs, IH, IW, H, {0,0, <<>>}),
+    render(Font, Res).
 
-render_text2(#font{tex=TexId, glyphs=Gs, height=H, ih=IH, iw=IW}, String) ->
-    {RX,RY,Bin} = render_text3(String, Gs, IH, IW, H, {0,0, <<>>}),
-    case Bin of
-	<<_:?BIN_XTRA/bytes>> -> ok;
-	<<_:2/unit:32, TxBin/bytes>> ->
-	    wx:retain_memory(Bin),
-	    gl:bindTexture(?GL_TEXTURE_2D, TexId),
-	    gl:vertexPointer(2, ?GL_FLOAT, 16, Bin),
-	    gl:texCoordPointer(2, ?GL_FLOAT, 16, TxBin),
-	    gl:enableClientState(?GL_VERTEX_ARRAY),
-	    gl:enableClientState(?GL_TEXTURE_COORD_ARRAY),
-	    gl:drawArrays(?GL_QUADS, 0, (byte_size(Bin)-?BIN_XTRA) div 16),
-	    gl:disableClientState(?GL_VERTEX_ARRAY),
-	    gl:disableClientState(?GL_TEXTURE_COORD_ARRAY),
-	    wx:release_memory(Bin)
-    end,
-    {RX,abs(RY-H)}.
-
+render_text3([$\n|String], Gs, IH, IW, H, Data0) ->
+    %% New line
+    {_,H0,Bin} = Data0,
+    render_text3(String, Gs, IH, IW, H, {0, H0+H, Bin});
+render_text3([$\t|String], Gs, IH, IW, H, Data0) ->
+    %% Tab
+    [{_, Space}] = ets:lookup(Gs, 32),
+    Data  = lists:foldl(fun(_, Data) ->
+				render_glyph(Space,IW,IH,Data)
+			end, Data0, "        "),
+    render_text3(String, Gs, IH, IW, H, Data);
 render_text3([Char|String], Gs, IH, IW, H, Data0) when is_integer(Char) ->
-    case array:get(Char, Gs) of
-	#glyph{}=Glyph ->
+    case ets:lookup(Gs, Char) of
+	[{_, #glyph{}=Glyph}] ->
 	    Data = render_glyph(Glyph,IW,IH,Data0),
 	    render_text3(String, Gs, IH, IW, H, Data);
-	undefined when Char =:= 10 -> %% NL
-	    {_,H0,Bin} = Data0,
-	    render_text3(String, Gs, IH, IW, H, {0, H0-H, Bin});
-	undefined when Char =:= 9 -> %% TAB
-	    Space = array:get(32, Gs),
-	    Data  = lists:foldl(fun(_, Data) ->
-					render_glyph(Space,IW,IH,Data)
-				end, Data0, "        "),
-	    render_text3(String, Gs, IH, IW, H, Data);
-	undefined -> %% Should we render something strange here
+	[] -> %% Should we render something strange here
 	    render_text3(String, Gs, IH, IW, H, Data0)
     end;
 render_text3([Other|String], Gs, IH, IW, H, Data0) ->
@@ -336,13 +349,13 @@ render_text3([Other|String], Gs, IH, IW, H, Data0) ->
 render_text3(Bin, Gs, IH, IW, H, Data) when is_binary(Bin) ->
     render_text3(unicode:characters_to_list(Bin), Gs, IH, IW, H, Data);
 render_text3([], _Gs, _IH, _IW, _H, {W,H0,Bin}) ->
-    {W, H0, <<Bin/bytes, 0:(?BIN_XTRA*8)>>}.
+    {W, H0, Bin}.
 
 render_glyph(#glyph{u=U,v=V,w=W,h=H},IW,IH, {X0,Y0,Bin}) ->
     X1 = X0 + W,
     UD = U + W*IW,
     VD = V + H*IH,
-    YH = Y0+H,
+    YH = Y0 - H,
     {X1,Y0,
      <<Bin/binary,         %% wxImage: 0,0 is upper left turn each
        X0:?F32,Y0:?F32, U:?F32, VD:?F32, % Vertex lower left, UV-coord up-left
@@ -353,6 +366,16 @@ render_glyph(#glyph{u=U,v=V,w=W,h=H},IW,IH, {X0,Y0,Bin}) ->
     }.
 
 %% Calculate texture size
+
+tex_size(Options, UsedHeight) ->
+    tex_size_1(proplists:get_value(pots, Options, false), UsedHeight).
+
+tex_size_1(true, UsedHeight) -> UsedHeight;
+tex_size_1(false, UsedHeight) ->
+    case UsedHeight rem 4 of %% Make it rem 4 for compression
+	0 -> UsedHeight;
+	Diff -> UsedHeight + 4-Diff
+    end.
 
 calc_tex_size(No, CW, CH) ->
     %% Add some extra chars to be sure it fits.
@@ -404,7 +427,7 @@ debug(W,H, Bin0) ->
     Bin = << <<G:8, G:8, G:8>> || <<_:8, G:8>> <= Bin0>>,
     Image = wxImage:new(W,H,Bin),
     Title = io_lib:format("DEBUG ~px~p", [W,H]),
-    Frame = wxFrame:new(wx:null(), ?wxID_ANY, Title, [{size, {W+10, H+10}}]),
+    Frame = wxFrame:new(wx:null(), ?wxID_ANY, Title, [{size, {W+40, H+40}}]),
     Panel = wxPanel:new(Frame),
     Paint = fun(_,_) ->
 		    DC=wxPaintDC:new(Panel),
